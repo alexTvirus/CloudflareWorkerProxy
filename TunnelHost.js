@@ -212,7 +212,7 @@ export class TunnelHost {
       try {
         console.log(data)
         const raw = typeof data === 'string' ? data : new TextDecoder().decode(data);
-        const msg = JSON.parse(raw);
+        //const msg = JSON.parse(raw);
         server.send(JSON.stringify({ type: 'pong' })); return;
         //if (msg.type === 'ping') {
        //   server.send(JSON.stringify({ type: 'pong' }));
