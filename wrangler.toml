@@ -1,0 +1,20 @@
+name             = "lite-http-tunnel"
+main             = "src/index.js"
+compatibility_date = "2024-09-01"
+
+# ── Biến môi trường (override trong CF Dashboard → Settings → Variables) ──
+[vars]
+SECRET_KEY             = "abc"
+VERIFY_TOKEN           = "abc"
+JWT_GENERATOR_USERNAME = "abc"
+JWT_GENERATOR_PASSWORD = "abc"
+
+# ── Durable Objects ───────────────────────────────────────────────────────
+# Mỗi hostname tunnel sẽ có một TunnelHost instance riêng biệt
+[[durable_objects.bindings]]
+name       = "TUNNEL_HOST"
+class_name = "TunnelHost"
+
+[[migrations]]
+tag         = "v1"
+new_classes = ["TunnelHost"]
