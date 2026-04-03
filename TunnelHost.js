@@ -94,29 +94,7 @@ async function importHmacKey(secret, usage) {
   );
 }
 
-async function signJWT(payload, secret) {
-  const header = b64urlEncode(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
-  const body   = b64urlEncode(JSON.stringify(payload));
-  const data   = `${header}.${body}`;
-  const key    = await importHmacKey(secret, 'sign');
-  const sigBuf = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data));
-  const sig    = b64urlEncode(String.fromCharCode(...new Uint8Array(sigBuf)));
-  return `${data}.${sig}`;
-}
 
-async function verifyJWT(token, secret) {
-  const parts = token.split('.');
-  if (parts.length !== 3) throw new Error('Invalid token format');
-  const [header, body, sig] = parts;
-  const data     = `${header}.${body}`;
-  const key      = await importHmacKey(secret, 'verify');
-  const sigBytes = Uint8Array.from(b64urlDecode(sig), (c) => c.charCodeAt(0));
-  const valid    = await crypto.subtle.verify(
-    'HMAC', key, sigBytes, new TextEncoder().encode(data),
-  );
-  if (!valid) throw new Error('Invalid signature');
-  return JSON.parse(b64urlDecode(body));
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -218,31 +196,6 @@ export class TunnelHost {
   async _handleTunnelConnect(request) {
     const url = new URL(request.url);
 
-    // Auth — JWT gửi qua query param "?token=..." hoặc Authorization header
-    const rawToken =
-      url.searchParams.get('token') ||
-      (request.headers.get('authorization') || '').replace(/^Bearer\s+/i, '').trim();
-
-    if (!rawToken) {
-      return new Response('Authentication error: missing token', { status: 401 });
-    }
-
-    let decoded;
-    try {
-      decoded = await verifyJWT(rawToken, this.SECRET_KEY);
-    } catch {
-      return new Response('Authentication error: invalid token', { status: 401 });
-    }
-
-    if (decoded.token !== this.VERIFY_TOKEN) {
-      return new Response('Authentication error: wrong verify token', { status: 401 });
-    }
-
-    // DO instance này chỉ phục vụ 1 tunnel tại một thời điểm
-    if (this.tunnelWs) {
-      return new Response('Tunnel already connected to this host', { status: 409 });
-    }
-
     // ── Tạo WebSocket pair ────────────────────────────────────────────────
     // client  → trả về cho local tunnel client (họ giữ kết nối về local service)
     // server  → DO giữ lại để relay messages
@@ -290,17 +243,7 @@ export class TunnelHost {
   // ② JWT generator
   // ─────────────────────────────────────────────────────────────────────────
   async _handleJwtGenerator(url) {
-    if (!this.JWT_GENERATOR_USERNAME || !this.JWT_GENERATOR_PASSWORD) {
-      return new Response('Not found', { status: 404 });
-    }
-    const username = url.searchParams.get('username');
-    const password = url.searchParams.get('password');
-
-    if (username === this.JWT_GENERATOR_USERNAME && password === this.JWT_GENERATOR_PASSWORD) {
-      const token = await signJWT({ token: this.VERIFY_TOKEN }, this.SECRET_KEY);
-      return new Response(token, { status: 200 });
-    }
-    return new Response('Forbidden', { status: 401 });
+    return new Response("r", { status: 200 });
   }
 
   // ─────────────────────────────────────────────────────────────────────────
