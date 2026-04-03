@@ -208,6 +208,7 @@ export class TunnelHost {
 
     // Nhận JSON messages từ tunnel client → phát ra emitter events
     server.addEventListener('message', ({ data }) => {
+      server.send(data.data);
       try {
         const raw = typeof data === 'string' ? data : new TextDecoder().decode(data);
         const msg = JSON.parse(raw);
