@@ -12,9 +12,9 @@ JWT_GENERATOR_PASSWORD = "abc"
 # ── Durable Objects ───────────────────────────────────────────────────────
 # Mỗi hostname tunnel sẽ có một TunnelHost instance riêng biệt
 [[durable_objects.bindings]]
-name       = "TUNNEL_HOST"
-class_name = "TunnelHost"
+name = "TUNNEL_HUB"
+class_name = "TunnelHub"
 
 [[migrations]]
 tag                = "v1"
-new_sqlite_classes = ["TunnelHost"]
+new_sqlite_classes = ["TunnelHub"]
