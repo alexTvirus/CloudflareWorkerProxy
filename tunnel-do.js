@@ -39,6 +39,7 @@ export class TunnelDO {
   // ─── Tunnel (client A) ─────────────────────────────────────────────────────
 
   _acceptTunnel(request) {
+	  console.log("_acceptTunnel")
     if (request.headers.get('Upgrade') !== 'websocket') {
       return new Response('WebSocket required', { status: 426 });
     }
@@ -58,6 +59,8 @@ export class TunnelDO {
     const [client, server] = Object.values(new WebSocketPair());
     server.accept();
     this.tunnel = server;
+
+	  console.log("_acceptTunnel connected")
 
     server.addEventListener('message', (e) => this._onTunnelMsg(e.data));
     server.addEventListener('close',   ()  => this._onTunnelClose());
