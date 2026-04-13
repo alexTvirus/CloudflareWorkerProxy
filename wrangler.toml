@@ -8,13 +8,14 @@ SECRET_KEY             = "abc"
 VERIFY_TOKEN           = "abc"
 JWT_GENERATOR_USERNAME = "abc"
 JWT_GENERATOR_PASSWORD = "abc"
+TUNNEL_TOKEN = "abc"
 
 # ── Durable Objects ───────────────────────────────────────────────────────
 # Mỗi hostname tunnel sẽ có một TunnelHost instance riêng biệt
 [[durable_objects.bindings]]
-name = "TUNNEL_HUB"
-class_name = "TunnelHub"
+name = "TUNNEL"
+class_name = "TunnelDO"
 
 [[migrations]]
 tag                = "v1"
-new_sqlite_classes = ["TunnelHub"]
+new_sqlite_classes = ["TunnelDO"]
