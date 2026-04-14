@@ -1,4 +1,4 @@
-name             = "testxoasocket1"
+name             = "testsockpro"
 main             = "index.js"
 compatibility_date = "2024-09-01"
 
