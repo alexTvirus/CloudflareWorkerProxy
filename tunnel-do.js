@@ -1,5 +1,7 @@
 // src/tunnel-do.js — Durable Object giữ kết nối tunnel
 // Deploy lên Cloudflare Workers
+// Sử dụng Cloudflare WebSocket Hibernation API để giữ kết nối ổn định,
+// không bị Cloudflare tắt giữa chừng khi DO idle.
 
 // ─── Binary Frame Protocol ────────────────────────────────────────────────────
 //
@@ -15,6 +17,10 @@ const CHUNK_SZ  = 256 * 1024; // 256 KB – kích thước mỗi chunk request b
 const PING_MS   = 20_000;     // gửi PING mỗi 20 giây
 
 const ZERO_ID = '00000000-0000-0000-0000-000000000000';
+
+// Tag định danh loại WebSocket – dùng bởi Hibernation API
+const TAG_TUNNEL = 'tunnel';
+const tagClient  = id => `client:${id}`;
 
 /** Loại message (giống nhau ở cả DO và client) */
 const M = Object.freeze({
@@ -96,21 +102,29 @@ export class TunnelDO {
     this.state  = state;
     this.env    = env;
 
-    /** WebSocket của client A (tunnel agent) */
-    this.tunnel = null;
+    // ── LƯU Ý VỀ HIBERNATION ──────────────────────────────────────────────────
+    // Khi DO hibernate, toàn bộ in-memory state (pending, clients) bị mất.
+    // Tuy nhiên với tunnel này:
+    //   • this.pending  – chỉ tồn tại trong scope của một request đang xử lý;
+    //     request đó giữ DO awake cho đến khi hoàn thành → không bị mất.
+    //   • this.clients  – WebSocket của client B cũng được đăng ký qua
+    //     ctx.acceptWebSocket nên được khôi phục sau hibernate qua getWebSockets().
+    //     Map này được re-populate lazily trong _getClientWs().
+    // ──────────────────────────────────────────────────────────────────────────
 
     /**
      * Map id → { resolve, reject, writer? }
      *
-     * - HTTP request: writer được gán khi nhận HTTP_RES_HEAD, giữ đến HTTP_RES_END
-     * - WS: resolve/reject dùng một lần, sau đó xoá
+     * - HTTP request: writer được gán khi nhận HTTP_RES_HEAD
+     * - WS: resolve/reject dùng một lần rồi xoá
      */
     this.pending = new Map();
 
-    /** Map id → WebSocket của client B (các WebSocket proxy) */
+    /**
+     * Cache id → WebSocket (client B).
+     * Được populate từ ctx.getWebSockets(tagClient(id)) khi cần.
+     */
     this.clients = new Map();
-
-    this._pingTimer = null;
   }
 
   // ─── Router ────────────────────────────────────────────────────────────────
@@ -129,12 +143,37 @@ export class TunnelDO {
       return this._acceptTunnel(request, TUNNEL_TOKEN);
     }
 
-    if (!this.tunnel || this.tunnel.readyState !== WebSocket.OPEN) {
+    if (!this._getTunnelWs()) {
       return new Response('No tunnel connected', { status: 200 });
     }
 
     if (upgrade === 'websocket') return this._proxyWs(request);
     return this._proxyHttp(request);
+  }
+
+  // ─── Helpers lấy WebSocket từ Hibernation runtime ─────────────────────────
+
+  /**
+   * Trả về WebSocket tunnel đang hoạt động (nếu có).
+   * Dùng ctx.getWebSockets(tag) thay vì this.tunnel để an toàn sau hibernate.
+   */
+  _getTunnelWs() {
+    const sockets = this.state.getWebSockets(TAG_TUNNEL);
+    return sockets.length > 0 ? sockets[0] : null;
+  }
+
+  /**
+   * Trả về WebSocket của client B theo id.
+   * Tìm trong cache trước, nếu không có thì hỏi runtime.
+   */
+  _getClientWs(id) {
+    if (this.clients.has(id)) return this.clients.get(id);
+    const sockets = this.state.getWebSockets(tagClient(id));
+    if (sockets.length > 0) {
+      this.clients.set(id, sockets[0]);
+      return sockets[0];
+    }
+    return null;
   }
 
   // ─── Chấp nhận tunnel từ client A ─────────────────────────────────────────
@@ -154,21 +193,17 @@ export class TunnelDO {
     this._closeTunnel('Replaced by new connection');
 
     const [client, server] = Object.values(new WebSocketPair());
-    server.accept();
-    this.tunnel = server;
 
-    // Keepalive: gửi PING để giữ kết nối qua proxy/CDN
-    this._pingTimer = setInterval(() => {
-      if (this.tunnel?.readyState === WebSocket.OPEN) {
-        try { this.tunnel.send(encode(M.PING, ZERO_ID, null, null)); } catch {}
-      } else {
-        clearInterval(this._pingTimer);
-      }
-    }, PING_MS);
+    // ── HIBERNATION API ──────────────────────────────────────────────────────
+    // Thay server.accept() bằng ctx.acceptWebSocket(server, tags).
+    // Runtime CF quản lý vòng đời; DO có thể hibernate khi không có I/O
+    // và được đánh thức tự động khi có message mới đến.
+    // Tag 'tunnel' dùng để lấy lại socket sau khi wake-up.
+    this.state.acceptWebSocket(server, [TAG_TUNNEL]);
+    // ────────────────────────────────────────────────────────────────────────
 
-    server.addEventListener('message', e => this._onTunnelMsg(e.data));
-    server.addEventListener('close',   () => this._onTunnelClose());
-    server.addEventListener('error',   () => this._onTunnelClose());
+    // Keepalive qua Alarm thay vì setInterval (setInterval không tồn tại sau hibernate)
+    this._scheduleNextPing();
 
     console.log('[DO] Tunnel client A kết nối');
     return new Response(null, { status: 101, webSocket: client });
@@ -176,17 +211,18 @@ export class TunnelDO {
 
   /** Đóng tunnel chủ động (reset hoặc bị thay thế). */
   _closeTunnel(reason) {
-    clearInterval(this._pingTimer);
-    if (this.tunnel) {
-      try { this.tunnel.close(1000, reason); } catch {}
-      this.tunnel = null;
+    // Huỷ alarm ping nếu đang chờ
+    this.state.storage.deleteAlarm().catch(() => {});
+
+    const ws = this._getTunnelWs();
+    if (ws) {
+      try { ws.close(1000, reason); } catch {}
     }
   }
 
   /** Xử lý khi tunnel bị đóng (lỗi hoặc client A disconnect). */
   _onTunnelClose() {
-    clearInterval(this._pingTimer);
-    this.tunnel = null;
+    this.state.storage.deleteAlarm().catch(() => {});
     console.log('[DO] Tunnel client A ngắt kết nối');
 
     // Huỷ tất cả streaming response đang mở
@@ -199,11 +235,111 @@ export class TunnelDO {
     }
     this.pending.clear();
 
-    // Đóng tất cả WebSocket của client B
-    for (const [, ws] of this.clients) {
+    // Đóng tất cả WebSocket client B còn đang sống
+    for (const ws of this.state.getWebSockets()) {
+      // Bỏ qua socket có tag 'tunnel' (đã đóng rồi)
+      const tags = ws.tags ?? [];
+      if (tags.includes(TAG_TUNNEL)) continue;
       try { ws.close(1001, 'Tunnel disconnected'); } catch {}
     }
     this.clients.clear();
+  }
+
+  // ─── Hibernation API – message handler (thay addEventListener) ─────────────
+
+  /**
+   * Được CF runtime gọi khi BẤT KỲ WebSocket nào được acceptWebSocket nhận message.
+   * Phân biệt tunnel vs client B qua tag.
+   */
+  webSocketMessage(ws, message) {
+    const tags = ws.tags ?? [];
+
+    if (tags.includes(TAG_TUNNEL)) {
+      // Message từ client A (tunnel)
+      this._onTunnelMsg(message);
+    } else {
+      // Message từ client B (WebSocket proxy)
+      // Tìm id từ tag 'client:<id>'
+      const clientTag = tags.find(t => t.startsWith('client:'));
+      if (!clientTag) return;
+      const id = clientTag.slice(7); // bỏ 'client:'
+
+      const tunnel = this._getTunnelWs();
+      if (!tunnel) return;
+
+      const binary = message instanceof ArrayBuffer;
+      this._tunnelSend(encode(M.WS_DATA, id, { binary },
+        binary ? new Uint8Array(message) : _te.encode(message)));
+    }
+  }
+
+  /**
+   * Được CF runtime gọi khi WebSocket đóng (thay addEventListener 'close').
+   */
+  webSocketClose(ws, code, reason, wasClean) {
+    const tags = ws.tags ?? [];
+
+    if (tags.includes(TAG_TUNNEL)) {
+      this._onTunnelClose();
+    } else {
+      const clientTag = tags.find(t => t.startsWith('client:'));
+      if (!clientTag) return;
+      const id = clientTag.slice(7);
+
+      this.clients.delete(id);
+
+      const tunnel = this._getTunnelWs();
+      if (tunnel) {
+        try { this._tunnelSend(encode(M.WS_CLOSE, id, null, null)); } catch {}
+      }
+    }
+  }
+
+  /**
+   * Được CF runtime gọi khi WebSocket có lỗi (thay addEventListener 'error').
+   */
+  webSocketError(ws, error) {
+    const tags = ws.tags ?? [];
+
+    if (tags.includes(TAG_TUNNEL)) {
+      console.error('[DO] Tunnel WebSocket lỗi:', error);
+      this._onTunnelClose();
+    } else {
+      const clientTag = tags.find(t => t.startsWith('client:'));
+      if (clientTag) {
+        const id = clientTag.slice(7);
+        this.clients.delete(id);
+        const tunnel = this._getTunnelWs();
+        if (tunnel) {
+          try { this._tunnelSend(encode(M.WS_CLOSE, id, null, null)); } catch {}
+        }
+      }
+    }
+  }
+
+  // ─── Alarm – thay thế setInterval cho PING (Hibernation-safe) ─────────────
+
+  /**
+   * Lên lịch alarm tiếp theo để gửi PING.
+   * Alarm tồn tại qua hibernate, không như setInterval.
+   */
+  _scheduleNextPing() {
+    this.state.storage.setAlarm(Date.now() + PING_MS).catch(() => {});
+  }
+
+  /**
+   * CF runtime gọi alarm() khi đến giờ.
+   * Gửi PING nếu tunnel còn sống, sau đó lên lịch alarm tiếp theo.
+   */
+  async alarm() {
+    const tunnel = this._getTunnelWs();
+    if (tunnel) {
+		try {  tunnel.ping();} catch {}
+      try { tunnel.send(encode(M.PING, ZERO_ID, null, null)); } catch {}
+      // Tiếp tục lên lịch alarm kế
+      this._scheduleNextPing();
+    }
+    // Nếu không còn tunnel thì không lên lịch nữa → alarm tự dừng
   }
 
   // ─── Dispatch message từ client A ─────────────────────────────────────────
@@ -218,9 +354,11 @@ export class TunnelDO {
     switch (f.type) {
 
       // ── Keepalive ──────────────────────────────────────────────────────────
-      case M.PING:
-        try { this.tunnel.send(encode(M.PONG, ZERO_ID, null, null)); } catch {}
+      case M.PING: {
+        const tunnel = this._getTunnelWs();
+        try { tunnel?.send(encode(M.PONG, ZERO_ID, null, null)); } catch {}
         break;
+      }
       case M.PONG:
         break;
 
@@ -234,7 +372,7 @@ export class TunnelDO {
        */
       case M.HTTP_RES_HEAD: {
         const p = this.pending.get(f.id);
-        if (!p || p.writer) break; // không tìm thấy hoặc đã resolve
+        if (!p || p.writer) break;
 
         const { readable, writable } = new TransformStream();
         p.writer = writable.getWriter();
@@ -251,13 +389,11 @@ export class TunnelDO {
       /**
        * Nhận một chunk của response body.
        * Ghi vào WritableStream writer (fire-and-forget).
-       * TransformStream nội bộ CF giữ thứ tự và xử lý backpressure hạ nguồn.
        */
       case M.HTTP_RES_CHUNK: {
         const p = this.pending.get(f.id);
         if (p?.writer && f.payload.length > 0) {
           p.writer.write(f.payload).catch(() => {
-            // Client B đã đóng kết nối – xoá pending để giải phóng memory
             this.pending.delete(f.id);
           });
         }
@@ -266,7 +402,6 @@ export class TunnelDO {
 
       /**
        * Kết thúc response body.
-       * Đóng hoặc abort writer tùy theo cờ ok.
        */
       case M.HTTP_RES_END: {
         const p = this.pending.get(f.id);
@@ -280,7 +415,6 @@ export class TunnelDO {
             p.writer.abort(new Error(f.meta?.error || 'upstream error')).catch(() => {});
           }
         } else if (f.meta?.ok === false) {
-          // HTTP_RES_HEAD chưa đến kịp (trường hợp 502 ngay lập tức)
           p.reject(new Error(f.meta?.error || 'upstream error'));
         }
         break;
@@ -296,12 +430,11 @@ export class TunnelDO {
         break;
       }
 
-      // ── WebSocket data / close ────────────────────────────────────────────
+      // ── WebSocket data / close ─────────────────────────────────────────────
       case M.WS_DATA: {
-        const ws = this.clients.get(f.id);
+        const ws = this._getClientWs(f.id);
         if (!ws) break;
         if (f.meta?.binary) {
-          // Gửi binary: trích ArrayBuffer từ Uint8Array
           ws.send(f.payload.buffer.slice(
             f.payload.byteOffset,
             f.payload.byteOffset + f.payload.byteLength,
@@ -313,7 +446,7 @@ export class TunnelDO {
       }
 
       case M.WS_CLOSE: {
-        const ws = this.clients.get(f.id);
+        const ws = this._getClientWs(f.id);
         this.clients.delete(f.id);
         if (ws) try { ws.close(1000, 'Closed by tunnel'); } catch {}
         break;
@@ -333,7 +466,7 @@ export class TunnelDO {
       headers: headersToObj(request.headers),
     }, null));
 
-    // 2. Stream request body theo từng chunk (tránh buffer toàn bộ upload vào memory)
+    // 2. Stream request body theo từng chunk
     if (request.body) {
       const reader = request.body.getReader();
       let bodyOk = true;
@@ -341,7 +474,6 @@ export class TunnelDO {
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
-          // Chia thành các chunk ≤ CHUNK_SZ
           for (let off = 0; off < value.byteLength; off += CHUNK_SZ) {
             this._tunnelSend(encode(M.HTTP_REQ_CHUNK, id, null,
               value.subarray(off, Math.min(off + CHUNK_SZ, value.byteLength))));
@@ -354,7 +486,6 @@ export class TunnelDO {
       }
 
       if (!bodyOk) {
-        // Báo client A huỷ request đang mở
         this._tunnelSend(encode(M.HTTP_REQ_END, id, { cancel: true }, null));
         return new Response('Request body read error', { status: 400 });
       }
@@ -363,8 +494,7 @@ export class TunnelDO {
     // 3. Kết thúc request body
     this._tunnelSend(encode(M.HTTP_REQ_END, id, { cancel: false }, null));
 
-    // 4. Chờ response headers (promise resolve khi nhận HTTP_RES_HEAD)
-    //    Timeout chỉ tính đến khi nhận được headers, KHÔNG phải toàn bộ body
+    // 4. Chờ response headers
     let response;
     try {
       response = await this._waitFor(id, 60_000);
@@ -372,7 +502,6 @@ export class TunnelDO {
       return new Response(e.message, { status: 502 });
     }
 
-    // 5. Trả về Response với streaming body (TransformStream)
     return response;
   }
 
@@ -398,22 +527,15 @@ export class TunnelDO {
     }
 
     const [client, server] = Object.values(new WebSocketPair());
-    server.accept();
+
+    // ── HIBERNATION API ──────────────────────────────────────────────────────
+    // Đăng ký WebSocket client B với tag 'client:<id>' để:
+    //   1. Không bị tắt bởi CF khi DO hibernate
+    //   2. Có thể lấy lại socket bằng getWebSockets(tagClient(id))
+    this.state.acceptWebSocket(server, [tagClient(id)]);
+    // ────────────────────────────────────────────────────────────────────────
+
     this.clients.set(id, server);
-
-    server.addEventListener('message', e => {
-      if (!this.tunnel) return;
-      const binary = e.data instanceof ArrayBuffer;
-      this._tunnelSend(encode(M.WS_DATA, id, { binary },
-        binary ? new Uint8Array(e.data) : _te.encode(e.data)));
-    });
-
-    server.addEventListener('close', () => {
-      this.clients.delete(id);
-      if (this.tunnel) {
-        try { this._tunnelSend(encode(M.WS_CLOSE, id, null, null)); } catch {}
-      }
-    });
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -422,15 +544,14 @@ export class TunnelDO {
 
   /** Gửi frame qua tunnel, bỏ qua nếu tunnel đã đóng. */
   _tunnelSend(frame) {
-    if (this.tunnel?.readyState === WebSocket.OPEN) {
-      try { this.tunnel.send(frame); } catch {}
+    const tunnel = this._getTunnelWs();
+    if (tunnel) {
+      try { tunnel.send(frame); } catch {}
     }
   }
 
   /**
    * Chờ response/accept cho một request id cụ thể.
-   * Với HTTP: resolve bằng Response (streaming), giữ pending để nhận chunks.
-   * Với WS:   resolve bằng { accepted }, xoá pending ngay.
    */
   _waitFor(id, ms) {
     return new Promise((resolve, reject) => {
