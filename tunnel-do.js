@@ -138,7 +138,7 @@ export class TunnelDO {
 
     // ── Binary frame: forward thẳng, zero-copy ───────────────────────────────
     // ArrayBuffer từ Hibernation API có thể là shared view → slice để an toàn
-    const frame = null;
+    let frame = null;
 	  
 	  if(message instanceof ArrayBuffer){
 		  frame = message
