@@ -177,6 +177,7 @@ export class TunnelDO {
       // A đóng → dừng alarm, báo B
       this.state.storage.deleteAlarm().catch(() => {});
       const b = this._getB();
+		if (b) try { b.send('CLIENT_DISCONNECTED'); } catch {}
       if (b) try { b.close(1001, 'Tunnel disconnected'); } catch {}
       return;
     }
