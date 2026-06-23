@@ -1,5 +1,5 @@
 // tunnel-do-simple.js — Durable Object relay đơn giản
-// 1 client A (/$web_tunnel) + 1 client B (/$web_client)
+// 1 client A  (/$web_tunnel) + 1 client B (/$web_client)
 // Không có binary protocol header tự chế:
 //   - text frame  → PING / PONG (control, xử lý nội bộ)
 //   - binary frame → raw payload, forward thẳng, zero-copy
