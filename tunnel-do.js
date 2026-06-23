@@ -1,5 +1,5 @@
 // tunnel-do-simple.js — Durable Object relay đơn giản
-// 1 client A  (/$web_tunnel) + 1 client B (/$web_client)
+// 1 client A (/$web_tunnel) + 1 client B (/$web_client)
 // Không có binary protocol header tự chế:
 //   - text frame  → PING / PONG (control, xử lý nội bộ)
 //   - binary frame → raw payload, forward thẳng, zero-copy
@@ -212,6 +212,15 @@ export class TunnelDO {
         if (b) try { b.close(1001, 'LOCAL_DISCONNECTED'); } catch {}
         return;
       }
+	  if (tags.includes(TAG_A)) {
+			const b = this._getB();
+			if (b) try { b.send(message); } catch {}
+		} else if (tags.includes(TAG_B)) {
+			const a = this._getA();
+			if (a) try { a.send(message); } catch {}
+		} else {
+			console.warn('[DO] text frame từ side không xác định:', message);
+		}
       console.warn('[DO] text frame không rõ:', message);
       return;
     }
