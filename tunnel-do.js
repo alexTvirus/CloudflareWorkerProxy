@@ -48,7 +48,7 @@ const MSG_PONG = 'PONG';
 const LOCAL_DISCONNECTED = 'LOCAL_DISCONNECTED';
 
 // Giới hạn buffer "chờ phía kia reconnect" — tránh phình memory vô hạn
-const MAX_FAILOVER_BUFFER_BYTES = 2 * 1024 * 1024; // 2 MB mỗi hướng
+const MAX_FAILOVER_BUFFER_BYTES = 4 * 1024 * 1024; // 2 MB mỗi hướng
 
 // ─── Durable Object ───────────────────────────────────────────────────────────
 
